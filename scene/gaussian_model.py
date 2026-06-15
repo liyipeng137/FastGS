@@ -465,7 +465,8 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None,
+                                 scene_center = None, scene_prune_dist_mult = None):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -501,6 +502,10 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if scene_center is not None and scene_prune_dist_mult is not None and scene_prune_dist_mult > 0:
+            dists = torch.norm(self.get_xyz - scene_center, dim=1)
+            far_points = dists > scene_prune_dist_mult * extent
+            prune_mask = torch.logical_or(prune_mask, far_points)
 
         scores = 1 - pruning_score 
         to_remove = torch.sum(prune_mask)

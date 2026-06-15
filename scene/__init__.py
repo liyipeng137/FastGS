@@ -12,17 +12,35 @@
 import os
 import random
 import json
+import numpy as np
+import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.graphics_utils import BasicPointCloud
+
+
+def filter_point_cloud_by_scene_bounds(pcd, center, extent, dist_mult):
+    points = np.asarray(pcd.points)
+    dists = np.linalg.norm(points - center, axis=1)
+    keep_mask = dists <= dist_mult * extent
+    n_removed = int(np.sum(~keep_mask))
+    if n_removed > 0:
+        print(f"Filtered {n_removed} / {len(points)} points beyond {dist_mult:.2f}x scene extent")
+    return BasicPointCloud(
+        points=points[keep_mask],
+        colors=np.asarray(pcd.colors)[keep_mask],
+        normals=np.asarray(pcd.normals)[keep_mask],
+    )
 
 class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0],
+                 scene_init_dist_mult=None, scene_prune_dist_mult=None):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -67,6 +85,9 @@ class Scene:
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+        scene_center = -np.array(scene_info.nerf_normalization["translate"], dtype=np.float32)
+        self.scene_center = torch.tensor(scene_center, dtype=torch.float32, device="cuda")
+        self.scene_prune_dist_mult = scene_prune_dist_mult
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
@@ -80,7 +101,11 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            pcd = scene_info.point_cloud
+            if pcd is not None and scene_init_dist_mult is not None and scene_init_dist_mult > 0:
+                pcd = filter_point_cloud_by_scene_bounds(
+                    pcd, scene_center, self.cameras_extent, scene_init_dist_mult)
+            self.gaussians.create_from_pcd(pcd, self.cameras_extent)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

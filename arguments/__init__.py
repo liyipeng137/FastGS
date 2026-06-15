@@ -98,6 +98,8 @@ class OptimizationParams(ParamGroup):
         self.grad_thresh = 0.0002
         self.dense = 0.001
         self.mult = 0.5      # multiplier for the compact box to control the tile number of each splat
+        self.scene_init_dist_mult = 2.0   # init hard filter: keep points with dist <= mult * cameras_extent
+        self.scene_prune_dist_mult = 1.3  # densify prune: remove points with dist > mult * cameras_extent
 
         self.random_background = False
         self.optimizer_type = "default"
