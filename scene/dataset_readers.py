@@ -157,17 +157,30 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
+    hyper_pcd_path = os.path.join(path, "sparse/0/hyper_points3D.ply")
+
+    if os.path.exists(hyper_pcd_path):
+        import open3d as o3d
+        ply_o3d = o3d.io.read_point_cloud(hyper_pcd_path)
+        if not ply_o3d.has_normals():
+            ply_o3d.estimate_normals()
+        positions = np.asarray(ply_o3d.points)
+        colors = np.zeros((positions.shape[0], 3), dtype=np.float64)
+        normals = np.asarray(ply_o3d.normals) if ply_o3d.has_normals() else np.zeros_like(positions)
+        pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
+        ply_path = hyper_pcd_path
+        print(f"Loaded RGBD init point cloud: {ply_path}, points={positions.shape[0]}")
+    elif not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
