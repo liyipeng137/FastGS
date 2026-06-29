@@ -16,7 +16,7 @@ from random import randint
 from lpipsPyTorch import lpips
 from utils.loss_utils import l1_loss
 from fused_ssim import fused_ssim as fast_ssim
-from gaussian_renderer import render_fastgs, network_gui_ws
+from gaussian_renderer import render_fastgs, render_gsplat_depth, network_gui_ws
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -103,6 +103,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        if opt.lambda_depth > 0.0 and getattr(viewpoint_cam, "depth_prior", None) is not None:
+            render_depth = render_gsplat_depth(viewpoint_cam, gaussians)["depth"]
+            prior_depth = viewpoint_cam.depth_prior.to(render_depth.device)
+            valid_depth = torch.logical_and(prior_depth > opt.depth_min, prior_depth < opt.depth_max)
+            if valid_depth.any().item():
+                depth_loss = torch.abs(render_depth - prior_depth)[valid_depth].mean()
+                loss = loss + opt.lambda_depth * depth_loss
         loss.backward()
 
         iter_end.record()

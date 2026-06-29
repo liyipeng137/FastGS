@@ -108,3 +108,51 @@ def render_fastgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
             "visibility_filter" : (radii > 0).nonzero(),
             "radii": radii,
             "accum_metric_counts" : accum_metric_counts}
+
+def render_gsplat_depth(viewpoint_camera, pc: GaussianModel, render_mode="ED"):
+    """Render expected z-depth with gsplat while keeping FastGS rendering unchanged."""
+    try:
+        from gsplat import rasterization
+    except ImportError as exc:
+        raise ImportError(
+            "gsplat is required for depth prior supervision. Install gsplat or "
+            "leave depth_prior_dir empty to disable depth loss."
+        ) from exc
+
+    height = int(viewpoint_camera.image_height)
+    width = int(viewpoint_camera.image_width)
+    device = pc.get_xyz.device
+    dtype = pc.get_xyz.dtype
+
+    fx = width / (2.0 * math.tan(viewpoint_camera.FoVx * 0.5))
+    fy = height / (2.0 * math.tan(viewpoint_camera.FoVy * 0.5))
+    K = torch.tensor(
+        [[fx, 0.0, width * 0.5], [0.0, fy, height * 0.5], [0.0, 0.0, 1.0]],
+        dtype=dtype,
+        device=device,
+    )[None]
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(
+        device=device,
+        dtype=dtype,
+    )[None].contiguous()
+
+    renders, alphas, meta = rasterization(
+        means=pc.get_xyz,
+        quats=pc.get_rotation,
+        scales=pc.get_scaling,
+        opacities=pc.get_opacity.squeeze(-1),
+        colors=None,
+        viewmats=viewmat,
+        Ks=K,
+        width=width,
+        height=height,
+        near_plane=viewpoint_camera.znear,
+        far_plane=viewpoint_camera.zfar,
+        render_mode=render_mode,
+    )
+
+    return {
+        "depth": renders[0, ..., 0].unsqueeze(0),
+        "alpha": alphas[0, ..., 0].unsqueeze(0),
+        "meta": meta,
+    }

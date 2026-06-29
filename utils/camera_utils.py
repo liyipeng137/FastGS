@@ -10,11 +10,48 @@
 #
 
 from scene.cameras import Camera
+import os
 import numpy as np
+from PIL import Image
+import torch
+import torch.nn.functional as F
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 
 WARNED = False
+
+def _resolve_prior_root(source_path, prior_dir):
+    prior_dir = "" if prior_dir is None else str(prior_dir).strip()
+    if not prior_dir:
+        return None
+    if os.path.isabs(prior_dir):
+        return prior_dir
+    return os.path.join(source_path, prior_dir)
+
+def _load_depth_prior(args, cam_info, resolution):
+    depth_prior_dir = getattr(args, "depth_prior_dir", "")
+    depth_root = _resolve_prior_root(args.source_path, depth_prior_dir)
+    if depth_root is None:
+        return None
+
+    depth_format = (getattr(args, "depth_prior_format", "png") or "png").lower().lstrip(".")
+    depth_path = os.path.join(depth_root, f"{cam_info.image_name}.{depth_format}")
+    if not os.path.exists(depth_path):
+        return None
+
+    depth_img = Image.open(depth_path)
+    depth_np = np.asarray(depth_img).astype(np.float32)
+    if depth_np.ndim == 3:
+        depth_np = depth_np[..., 0]
+
+    depth_scale = float(getattr(args, "depth_prior_scale", 1000.0))
+    depth_prior = torch.from_numpy(depth_np)[None, None] / depth_scale
+    depth_prior = F.interpolate(
+        depth_prior,
+        size=(resolution[1], resolution[0]),
+        mode="nearest",
+    )[0]
+    return depth_prior
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
@@ -46,10 +83,13 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
+    depth_prior = _load_depth_prior(args, cam_info, resolution)
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  depth_prior=depth_prior)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

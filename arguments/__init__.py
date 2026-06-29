@@ -54,6 +54,9 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.depth_prior_dir = ""
+        self.depth_prior_format = "png"
+        self.depth_prior_scale = 1000.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -100,6 +103,9 @@ class OptimizationParams(ParamGroup):
         self.mult = 0.5      # multiplier for the compact box to control the tile number of each splat
         self.scene_init_dist_mult = 2.0   # init hard filter: keep points with dist <= mult * cameras_extent
         self.scene_prune_dist_mult = 1.3  # densify prune: remove points with dist > mult * cameras_extent
+        self.lambda_depth = 0.01
+        self.depth_min = 0.1
+        self.depth_max = 20.0
 
         self.random_background = False
         self.optimizer_type = "default"
