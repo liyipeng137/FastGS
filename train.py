@@ -34,6 +34,49 @@ except ImportError:
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 
 
+def depth_to_vis(depth):
+    import cv2
+
+    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0).astype(
+        np.float32,
+        copy=False,
+    )
+    valid_mask = np.isfinite(depth) & (depth > 0)
+    if np.any(valid_mask):
+        valid_depth = depth[valid_mask]
+        d_min = np.percentile(valid_depth, 2.0)
+        d_max = np.percentile(valid_depth, 98.0)
+        if d_max <= d_min:
+            d_max = d_min + 1e-6
+        depth_norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
+        depth_vis_u8 = (depth_norm * 255.0).astype(np.uint8)
+        depth_vis_u8[~valid_mask] = 0
+        return cv2.applyColorMap(depth_vis_u8, cv2.COLORMAP_TURBO)
+
+    h, w = depth.shape[:2]
+    return np.zeros((h, w, 3), dtype=np.uint8)
+
+
+def save_rendered_depth_debug(model_path, iteration, cameras, gaussians, num_views):
+    import cv2
+
+    if num_views <= 0 or not cameras:
+        return
+
+    out_dir = os.path.join(model_path, "depth_debug", f"iter_{iteration:06d}", "depth_vis")
+    os.makedirs(out_dir, exist_ok=True)
+
+    sample_count = min(num_views, len(cameras))
+    for idx, cam in enumerate(random.sample(cameras, sample_count)):
+        depth = render_gsplat_depth(cam, gaussians)["depth"][0]
+        depth_np = depth.detach().cpu().numpy()
+        depth_color = depth_to_vis(depth_np)
+        out_path = os.path.join(out_dir, f"{idx:02d}_{cam.image_name}.png")
+        cv2.imwrite(out_path, depth_color)
+
+    print(f"\n[ITER {iteration}] Saved rendered depth debug images to {out_dir}")
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -54,6 +97,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
+    train_cameras = scene.getTrainCameras()
+    depth_prior_count = sum(1 for cam in train_cameras if getattr(cam, "depth_prior", None) is not None)
+    depth_debug_enabled = opt.lambda_depth > 0.0 and depth_prior_count > 0
+    if depth_prior_count > 0:
+        print(f"Loaded depth priors for {depth_prior_count}/{len(train_cameras)} training cameras")
 
     # record time
     optim_start = torch.cuda.Event(enable_timing=True)
@@ -61,6 +109,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     total_time = 0.0
 
     ema_loss_for_log = 0.0
+    ema_rgb_loss_for_log = 0.0
+    ema_depth_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     bg = torch.rand((3), device="cuda") if opt.random_background else background
@@ -102,7 +152,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        rgb_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        depth_loss = image.new_tensor(0.0)
+        loss = rgb_loss
         if opt.lambda_depth > 0.0 and getattr(viewpoint_cam, "depth_prior", None) is not None:
             render_depth = render_gsplat_depth(viewpoint_cam, gaussians)["depth"]
             prior_depth = viewpoint_cam.depth_prior.to(render_depth.device)
@@ -117,9 +169,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            ema_rgb_loss_for_log = 0.4 * rgb_loss.item() + 0.6 * ema_rgb_loss_for_log
+            ema_depth_loss_for_log = 0.4 * depth_loss.item() + 0.6 * ema_depth_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "RGB": f"{ema_rgb_loss_for_log:.{7}f}",
+                    "Depth": f"{ema_depth_loss_for_log:.{7}f}",
+                })
                 progress_bar.update(10)
+                if tb_writer:
+                    tb_writer.add_scalar('train_loss_patches/rgb_loss', rgb_loss.item(), iteration)
+                    tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), iteration)
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -129,6 +190,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+            if (
+                depth_debug_enabled
+                and opt.depth_debug_interval > 0
+                and iteration % opt.depth_debug_interval == 0
+            ):
+                save_rendered_depth_debug(
+                    dataset.model_path,
+                    iteration,
+                    train_cameras,
+                    gaussians,
+                    opt.depth_debug_views,
+                )
             
             optim_start.record()
             

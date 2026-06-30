@@ -106,6 +106,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_depth = 0.01
         self.depth_min = 0.1
         self.depth_max = 20.0
+        self.depth_debug_interval = 1000
+        self.depth_debug_views = 10
 
         self.random_background = False
         self.optimizer_type = "default"
