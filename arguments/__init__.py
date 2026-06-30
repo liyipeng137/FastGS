@@ -54,7 +54,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
-        self.depth_prior_dir = ""
+        self.depth_prior_dir = "depth"
         self.depth_prior_format = "png"
         self.depth_prior_scale = 1000.0
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -103,9 +103,19 @@ class OptimizationParams(ParamGroup):
         self.mult = 0.5      # multiplier for the compact box to control the tile number of each splat
         self.scene_init_dist_mult = 2.0   # init hard filter: keep points with dist <= mult * cameras_extent
         self.scene_prune_dist_mult = 1.3  # densify prune: remove points with dist > mult * cameras_extent
-        self.lambda_depth = 0.01
+        self.lambda_depth = 0.1
         self.depth_min = 0.1
-        self.depth_max = 20.0
+        self.depth_max = 10.0
+        self.depth_start_iter = 1500
+        self.depth_ramp_end_iter = 5000
+        self.depth_decay_start_iter = 15_000
+        self.depth_final_weight = 0.005
+        self.depth_smooth_l1_beta = 0.05
+        self.depth_pearson_start_iter = 70000 # disable pearson depth loss
+        self.depth_pearson_weight = 0.1
+        self.depth_pearson_patch_size = 128
+        self.depth_pearson_patch_ratio = 0.5
+        self.depth_pearson_min_valid_ratio = 0.1
         self.depth_debug_interval = 1000
         self.depth_debug_views = 10
 

@@ -32,6 +32,103 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
+import torch.nn.functional as F
+
+def masked_pearson_depth_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    valid_mask = valid_mask.bool()
+    if valid_mask.sum().item() < 2:
+        return pred_depth.new_tensor(0.0)
+
+    src = pred_depth[valid_mask]
+    tgt = gt_depth[valid_mask]
+    src = src - src.mean()
+    tgt = tgt - tgt.mean()
+
+    src_std = src.std(unbiased=False)
+    tgt_std = tgt.std(unbiased=False)
+    if src_std.item() < 1e-6 or tgt_std.item() < 1e-6:
+        return pred_depth.new_tensor(0.0)
+
+    src = src / (src_std + 1e-6)
+    tgt = tgt / (tgt_std + 1e-6)
+    corr = (src * tgt).mean()
+    return 1.0 - corr
+
+
+def masked_local_pearson_loss(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    valid_mask: torch.Tensor,
+    confidence_map: torch.Tensor | None = None,
+    box_p: int = 128,
+    p_corr: float = 0.5,
+    min_valid_ratio: float = 0.1,
+) -> torch.Tensor:
+    _, h, w = pred_depth.shape
+    if h < box_p or w < box_p:
+        return masked_pearson_depth_loss(pred_depth, gt_depth, valid_mask)
+
+    num_box_h = max(h // box_p, 1)
+    num_box_w = max(w // box_p, 1)
+    n_corr = max(int(p_corr * num_box_h * num_box_w), 1)
+    max_h = h - box_p + 1
+    max_w = w - box_p + 1
+    if confidence_map is not None:
+        conf2d = confidence_map.squeeze(0).clamp(0.0, 1.0)
+        valid2d = valid_mask.squeeze(0).float()
+        conf_patch = F.avg_pool2d(conf2d[None, None], kernel_size=box_p, stride=1)[0, 0]
+        valid_ratio_patch = F.avg_pool2d(valid2d[None, None], kernel_size=box_p, stride=1)[0, 0]
+        sample_scores = conf_patch * (valid_ratio_patch >= min_valid_ratio).float()
+        flat_scores = sample_scores.reshape(-1)
+        if flat_scores.sum().item() > 0:
+            sampled = torch.multinomial(flat_scores, n_corr, replacement=True)
+            x_0 = torch.div(sampled, max_w, rounding_mode="floor")
+            y_0 = sampled % max_w
+        else:
+            x_0 = torch.randint(0, max_h, size=(n_corr,), device=pred_depth.device)
+            y_0 = torch.randint(0, max_w, size=(n_corr,), device=pred_depth.device)
+    else:
+        x_0 = torch.randint(0, max_h, size=(n_corr,), device=pred_depth.device)
+        y_0 = torch.randint(0, max_w, size=(n_corr,), device=pred_depth.device)
+    min_valid_pixels = max(int(box_p * box_p * min_valid_ratio), 1)
+
+    loss_sum = pred_depth.new_tensor(0.0)
+    valid_patch_count = 0
+    for i in range(n_corr):
+        x_start, y_start = int(x_0[i].item()), int(y_0[i].item())
+        x_end, y_end = x_start + box_p, y_start + box_p
+        patch_mask = valid_mask[:, x_start:x_end, y_start:y_end]
+        if patch_mask.sum().item() < min_valid_pixels:
+            continue
+        patch_pred = pred_depth[:, x_start:x_end, y_start:y_end]
+        patch_gt = gt_depth[:, x_start:x_end, y_start:y_end]
+        loss_sum = loss_sum + masked_pearson_depth_loss(patch_pred, patch_gt, patch_mask)
+        valid_patch_count += 1
+
+    if valid_patch_count == 0:
+        return masked_pearson_depth_loss(pred_depth, gt_depth, valid_mask)
+    return loss_sum / valid_patch_count
+
+
+def get_depth_loss_weight(iteration, opt):
+    base_weight = float(getattr(opt, "lambda_depth", 0.0))
+    if base_weight <= 0.0:
+        return 0.0
+
+    start_iter = int(getattr(opt, "depth_start_iter", 0))
+    ramp_end_iter = int(getattr(opt, "depth_ramp_end_iter", start_iter))
+    if iteration < start_iter:
+        return 0.0
+
+    if ramp_end_iter > start_iter and iteration < ramp_end_iter:
+        ramp = (iteration - start_iter) / float(ramp_end_iter - start_iter)
+        return base_weight * max(0.0, min(1.0, ramp))
+
+    decay_start_iter = int(getattr(opt, "depth_decay_start_iter", 0))
+    if decay_start_iter > 0 and iteration >= decay_start_iter:
+        return float(getattr(opt, "depth_final_weight", base_weight))
+
+    return base_weight
 
 
 def depth_to_vis(depth):
@@ -154,14 +251,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         depth_loss = image.new_tensor(0.0)
+        depth_smooth_l1_loss = image.new_tensor(0.0)
+        depth_pearson_loss = image.new_tensor(0.0)
+        depth_weight = get_depth_loss_weight(iteration, opt)
         loss = rgb_loss
-        if opt.lambda_depth > 0.0 and getattr(viewpoint_cam, "depth_prior", None) is not None:
+        if depth_weight > 0.0 and getattr(viewpoint_cam, "depth_prior", None) is not None:
             render_depth = render_gsplat_depth(viewpoint_cam, gaussians)["depth"]
             prior_depth = viewpoint_cam.depth_prior.to(render_depth.device)
             valid_depth = torch.logical_and(prior_depth > opt.depth_min, prior_depth < opt.depth_max)
             if valid_depth.any().item():
-                depth_loss = torch.abs(render_depth - prior_depth)[valid_depth].mean()
-                loss = loss + opt.lambda_depth * depth_loss
+                depth_smooth_l1_loss = F.smooth_l1_loss(
+                    render_depth[valid_depth],
+                    prior_depth[valid_depth],
+                    beta=opt.depth_smooth_l1_beta,
+                )
+                depth_loss = depth_smooth_l1_loss
+
+                if (
+                    iteration >= opt.depth_pearson_start_iter
+                    and opt.depth_pearson_weight > 0.0
+                ):
+                    depth_confidence = getattr(viewpoint_cam, "depth_confidence", None)
+                    if depth_confidence is not None:
+                        depth_confidence = depth_confidence.to(render_depth.device)
+                    depth_pearson_loss = masked_local_pearson_loss(
+                        render_depth,
+                        prior_depth,
+                        valid_depth,
+                        confidence_map=depth_confidence,
+                        box_p=opt.depth_pearson_patch_size,
+                        p_corr=opt.depth_pearson_patch_ratio,
+                        min_valid_ratio=opt.depth_pearson_min_valid_ratio,
+                    )
+                    depth_loss = depth_loss + opt.depth_pearson_weight * depth_pearson_loss
+
+                loss = loss + depth_weight * depth_loss
         loss.backward()
 
         iter_end.record()
@@ -176,11 +300,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{7}f}",
                     "RGB": f"{ema_rgb_loss_for_log:.{7}f}",
                     "Depth": f"{ema_depth_loss_for_log:.{7}f}",
+                    "D_w": f"{depth_weight:.4f}",
                 })
                 progress_bar.update(10)
                 if tb_writer:
                     tb_writer.add_scalar('train_loss_patches/rgb_loss', rgb_loss.item(), iteration)
                     tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), iteration)
+                    tb_writer.add_scalar('train_loss_patches/depth_smooth_l1_loss', depth_smooth_l1_loss.item(), iteration)
+                    tb_writer.add_scalar('train_loss_patches/depth_pearson_loss', depth_pearson_loss.item(), iteration)
+                    tb_writer.add_scalar('train_loss_patches/depth_weight', depth_weight, iteration)
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -235,12 +363,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # The multiview consistent pruning of fastgs. We do it every 3k iterations after 15k
             # In this stage, the model converge basically. So we can prune more aggressively without degrading rendering quality.
             # You can check the rendering results of 20K iterations in arxiv version (https://arxiv.org/abs/2511.04283), the rendering quality is already very good.
-            if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
-                my_viewpoint_stack = scene.getTrainCameras().copy()
-                camlist = sampling_cameras(my_viewpoint_stack)
+            # if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+            #     my_viewpoint_stack = scene.getTrainCameras().copy()
+            #     camlist = sampling_cameras(my_viewpoint_stack)
 
-                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)                    
-                gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+            #     _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)                    
+            #     gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
         
             # Optimization step
             if iteration < opt.iterations:
