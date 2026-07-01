@@ -57,6 +57,19 @@ class ModelParams(ParamGroup):
         self.depth_prior_dir = "depth"
         self.depth_prior_format = "png"
         self.depth_prior_scale = 1000.0
+        self.add_background_sphere = True
+        self.background_sphere_center = "points"
+        self.background_sphere_distance = 2.2
+        self.background_sphere_points = 50000
+        self.background_sphere_color = "white"
+        self.background_sphere_opacity = 0.99
+        self.background_sphere_min_altitude = -float("inf")
+        self.freeze_background_sphere_position = True
+        self.freeze_background_sphere_scale = True
+        self.freeze_background_sphere_rotation = True
+        self.freeze_background_sphere_opacity = True
+        self.freeze_background_sphere_color = True
+        self.freeze_background_sphere_sh_rest = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -76,6 +89,7 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
+        self.bg_iterations = 4_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01

@@ -68,9 +68,11 @@ class GaussianModel:
         self.shoptimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.background_mask = torch.empty(0, dtype=torch.bool)
         self.setup_functions()
 
     def capture(self, optimizer_type):
+        background_mask = self._ensure_background_mask()
         if optimizer_type == "default":
             return (
             self.active_sh_degree,
@@ -87,6 +89,7 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.shoptimizer.state_dict(),
             self.spatial_lr_scale,
+            background_mask,
         )
         else:
             return (
@@ -103,29 +106,54 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            background_mask,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum,
-        xyz_gradient_accum_abs, 
-        denom,
-        opt_dict, 
-        shopt_dict,
-        self.spatial_lr_scale) = model_args
+        background_mask = None
+        if getattr(training_args, "optimizer_type", "default") == "default":
+            if len(model_args) == 15:
+                (*model_args, background_mask) = model_args
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            xyz_gradient_accum_abs,
+            denom,
+            opt_dict,
+            shopt_dict,
+            self.spatial_lr_scale) = model_args
+        else:
+            if len(model_args) == 14:
+                (*model_args, background_mask) = model_args
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            xyz_gradient_accum_abs,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.xyz_gradient_accum_abs = xyz_gradient_accum_abs
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
-        self.shoptimizer.load_state_dict(shopt_dict)
+        if self.shoptimizer is not None:
+            self.shoptimizer.load_state_dict(shopt_dict)
+        if background_mask is not None:
+            self.background_mask = background_mask.to(device=self._xyz.device, dtype=torch.bool)
+        self._ensure_background_mask()
 
     @property
     def get_scaling(self):
@@ -164,7 +192,107 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def _ensure_background_mask(self):
+        n_points = self._xyz.shape[0]
+        device = self._xyz.device
+        if self.background_mask.numel() != n_points:
+            self.background_mask = torch.zeros((n_points,), dtype=torch.bool, device=device)
+        elif self.background_mask.device != device:
+            self.background_mask = self.background_mask.to(device=device)
+        self.background_mask = self.background_mask.bool()
+        return self.background_mask
+
+    @property
+    def get_foreground_mask(self):
+        return ~self._ensure_background_mask()
+
+    def _clear_optimizer_state_for_mask(self, group_name, mask):
+        optimizers = [self.optimizer]
+        if self.shoptimizer is not None:
+            optimizers.append(self.shoptimizer)
+        for optimizer in optimizers:
+            if optimizer is None:
+                continue
+            for group in optimizer.param_groups:
+                if group.get("name") != group_name:
+                    continue
+                state = optimizer.state.get(group["params"][0], None)
+                if state is None:
+                    continue
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in state and state[key].shape[0] == mask.shape[0]:
+                        state[key][mask] = 0.0
+
+    def apply_background_constraints(
+        self,
+        freeze_background_dc=False,
+        freeze_background_xyz=False,
+        freeze_background_scale=False,
+        freeze_background_rotation=False,
+        freeze_background_opacity=False,
+        freeze_background_sh_rest=False,
+    ):
+        if not any(
+            [
+                freeze_background_dc,
+                freeze_background_xyz,
+                freeze_background_scale,
+                freeze_background_rotation,
+                freeze_background_opacity,
+                freeze_background_sh_rest,
+            ]
+        ):
+            return
+        background_mask = self._ensure_background_mask()
+        if not background_mask.any():
+            return
+        with torch.no_grad():
+            if freeze_background_dc and self._features_dc.grad is not None:
+                self._features_dc.grad[background_mask] = 0.0
+                self._clear_optimizer_state_for_mask("f_dc", background_mask)
+            if freeze_background_xyz and self._xyz.grad is not None:
+                self._xyz.grad[background_mask] = 0.0
+                self._clear_optimizer_state_for_mask("xyz", background_mask)
+            if freeze_background_scale and self._scaling.grad is not None:
+                self._scaling.grad[background_mask] = 0.0
+                self._clear_optimizer_state_for_mask("scaling", background_mask)
+            if freeze_background_rotation and self._rotation.grad is not None:
+                self._rotation.grad[background_mask] = 0.0
+                self._clear_optimizer_state_for_mask("rotation", background_mask)
+            if freeze_background_opacity and self._opacity.grad is not None:
+                self._opacity.grad[background_mask] = 0.0
+                self._clear_optimizer_state_for_mask("opacity", background_mask)
+            if freeze_background_sh_rest and self._features_rest.grad is not None:
+                self._features_rest.grad[background_mask] = 0.0
+                self._clear_optimizer_state_for_mask("f_rest", background_mask)
+
+    def apply_background_color_pretrain_constraints(self):
+        background_mask = self._ensure_background_mask()
+        if not background_mask.any():
+            return
+        foreground_mask = ~background_mask
+        all_points_mask = torch.ones_like(background_mask)
+        with torch.no_grad():
+            if self._features_dc.grad is not None:
+                self._features_dc.grad[foreground_mask] = 0.0
+                self._clear_optimizer_state_for_mask("f_dc", foreground_mask)
+            if self._xyz.grad is not None:
+                self._xyz.grad.zero_()
+                self._clear_optimizer_state_for_mask("xyz", all_points_mask)
+            if self._scaling.grad is not None:
+                self._scaling.grad.zero_()
+                self._clear_optimizer_state_for_mask("scaling", all_points_mask)
+            if self._rotation.grad is not None:
+                self._rotation.grad.zero_()
+                self._clear_optimizer_state_for_mask("rotation", all_points_mask)
+            if self._opacity.grad is not None:
+                self._opacity.grad.zero_()
+                self._clear_optimizer_state_for_mask("opacity", all_points_mask)
+            if self._features_rest.grad is not None:
+                self._features_rest.grad.zero_()
+                self._clear_optimizer_state_for_mask("f_rest", all_points_mask)
+
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, background_mask=None, background_opacity=0.99):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -179,7 +307,20 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
+        if background_mask is None:
+            background_mask_tensor = torch.zeros((fused_point_cloud.shape[0],), dtype=torch.bool, device="cuda")
+        else:
+            background_mask_tensor = torch.as_tensor(background_mask, dtype=torch.bool, device="cuda")
+            if background_mask_tensor.shape[0] != fused_point_cloud.shape[0]:
+                raise ValueError("background_mask length must match point cloud size")
+
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        if background_mask_tensor.any():
+            background_opacity = float(background_opacity)
+            background_opacity = max(1e-4, min(1.0 - 1e-4, background_opacity))
+            opacities[background_mask_tensor] = self.inverse_opacity_activation(
+                background_opacity * torch.ones_like(opacities[background_mask_tensor])
+            )
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -188,6 +329,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.background_mask = background_mask_tensor
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -255,6 +397,7 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        l.append('is_background')
         return l
 
     def save_ply(self, path):
@@ -267,17 +410,23 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        background_mask = self._ensure_background_mask().detach().float().cpu().numpy()[:, None]
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, background_mask), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
     def reset_opacity(self):
-        opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        current_opacity = self.get_opacity
+        target_opacity = torch.min(current_opacity, torch.ones_like(current_opacity)*0.01)
+        background_mask = self._ensure_background_mask()
+        if background_mask.any():
+            target_opacity[background_mask] = current_opacity[background_mask]
+        opacities_new = self.inverse_opacity_activation(target_opacity)
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -315,12 +464,19 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
+        ply_property_names = [p.name for p in plydata.elements[0].properties]
+        if "is_background" in ply_property_names:
+            background_mask = np.asarray(plydata.elements[0]["is_background"]) > 0.5
+        else:
+            background_mask = np.zeros((xyz.shape[0],), dtype=bool)
+
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self.background_mask = torch.tensor(background_mask, dtype=torch.bool, device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -363,6 +519,7 @@ class GaussianModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        old_background_mask = self._ensure_background_mask()
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -377,6 +534,7 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.background_mask = old_background_mask[valid_points_mask]
         if self.tmp_radii is not None:
             self.tmp_radii = self.tmp_radii[valid_points_mask]
 
@@ -406,13 +564,19 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_background_mask=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
+
+        old_background_mask = self._ensure_background_mask()
+        if new_background_mask is None:
+            new_background_mask = torch.zeros((new_xyz.shape[0],), dtype=torch.bool, device=self._xyz.device)
+        else:
+            new_background_mask = new_background_mask.to(device=self._xyz.device, dtype=torch.bool)
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -421,6 +585,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self.background_mask = torch.cat((old_background_mask, new_background_mask), dim=0)
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -446,8 +611,9 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_background_mask = self._ensure_background_mask()[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_background_mask)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -462,11 +628,12 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_background_mask = self._ensure_background_mask()[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_background_mask)
 
     def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None,
-                                 scene_center = None, scene_prune_dist_mult = None):
+                                 scene_center = None, scene_prune_dist_mult = None, prune_extent = None):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -487,8 +654,9 @@ class GaussianModel:
         clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense*extent
         split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense*extent
 
-        all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
-        all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
+        foreground_mask = self.get_foreground_mask
+        all_clones = torch.logical_and(torch.logical_and(clone_qualifiers, grad_qualifiers), foreground_mask)
+        all_splits = torch.logical_and(torch.logical_and(split_qualifiers, grad_qualifiers_abs), foreground_mask)
 
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
@@ -497,15 +665,17 @@ class GaussianModel:
         self.densify_and_clone_fastgs(metric_mask, all_clones)
         self.densify_and_split_fastgs(metric_mask, all_splits)
 
+        prune_extent = extent if prune_extent is None else prune_extent
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * prune_extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         if scene_center is not None and scene_prune_dist_mult is not None and scene_prune_dist_mult > 0:
             dists = torch.norm(self.get_xyz - scene_center, dim=1)
-            far_points = dists > scene_prune_dist_mult * extent
+            far_points = dists > scene_prune_dist_mult * prune_extent
             prune_mask = torch.logical_or(prune_mask, far_points)
+        prune_mask = torch.logical_and(prune_mask, self.get_foreground_mask)
 
         scores = 1 - pruning_score 
         to_remove = torch.sum(prune_mask)
@@ -522,7 +692,12 @@ class GaussianModel:
             final_prune = torch.logical_and(prune_mask, selected_pts_mask)
             self.prune_points(final_prune)
         
-        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.8))
+        current_opacity = self.get_opacity
+        target_opacity = torch.min(current_opacity, torch.ones_like(current_opacity)*0.8)
+        background_mask = self._ensure_background_mask()
+        if background_mask.any():
+            target_opacity[background_mask] = current_opacity[background_mask]
+        opacities_new = inverse_sigmoid(target_opacity)
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
         tmp_radii = self.tmp_radii
@@ -542,4 +717,5 @@ class GaussianModel:
         prune_mask = (self.get_opacity < min_opacity).squeeze() 
         scores_mask = pruning_score > 0.9
         final_prune = torch.logical_or(prune_mask, scores_mask)
+        final_prune = torch.logical_and(final_prune, self.get_foreground_mask)
         self.prune_points(final_prune)

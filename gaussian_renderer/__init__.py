@@ -15,16 +15,44 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from diff_gaussian_rasterization_fastgs import GaussianRasterizationSettings, GaussianRasterizer
 
-def render_fastgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, mult, scaling_modifier = 1.0, override_color = None, get_flag=None, metric_map = None):
+def render_fastgs(
+    viewpoint_camera,
+    pc : GaussianModel,
+    pipe,
+    bg_color : torch.Tensor,
+    mult,
+    scaling_modifier = 1.0,
+    override_color = None,
+    get_flag=None,
+    metric_map = None,
+    render_mask = None,
+):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
- 
+    means3D = pc.get_xyz
+    features_dc = pc.get_features_dc
+    features_rest = pc.get_features_rest
+    opacity = pc.get_opacity
+    scales = pc.get_scaling
+    rotations = pc.get_rotation
+
+    if render_mask is not None:
+        render_mask = render_mask.to(device=means3D.device, dtype=torch.bool)
+        means3D = means3D[render_mask]
+        features_dc = features_dc[render_mask]
+        features_rest = features_rest[render_mask]
+        opacity = opacity[render_mask]
+        scales = scales[render_mask]
+        rotations = rotations[render_mask]
+        if override_color is not None and override_color.shape[0] == render_mask.shape[0]:
+            override_color = override_color[render_mask]
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     # screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-    screenspace_points = torch.zeros((pc.get_xyz.shape[0], 4), dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros((means3D.shape[0], 4), dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
@@ -57,35 +85,35 @@ def render_fastgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
     cov3D_precomp = None
 
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+        if render_mask is None:
+            cov3D_precomp = pc.get_covariance(scaling_modifier)
+        else:
+            cov3D_precomp = pc.get_covariance(scaling_modifier)[render_mask]
+        scales = None
+        rotations = None
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    dc = None
     shs = None
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            features = torch.cat((features_dc, features_rest), dim=1)
+            shs_view = features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
-            dc, shs = pc.get_features_dc, pc.get_features_rest
+            dc, shs = features_dc, features_rest
     else:
         colors_precomp = override_color
 
@@ -109,7 +137,7 @@ def render_fastgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
             "radii": radii,
             "accum_metric_counts" : accum_metric_counts}
 
-def render_gsplat_depth(viewpoint_camera, pc: GaussianModel, render_mode="ED"):
+def render_gsplat_depth(viewpoint_camera, pc: GaussianModel, render_mode="ED", include_background=False):
     """Render expected z-depth with gsplat while keeping FastGS rendering unchanged."""
     try:
         from gsplat import rasterization
@@ -123,6 +151,27 @@ def render_gsplat_depth(viewpoint_camera, pc: GaussianModel, render_mode="ED"):
     width = int(viewpoint_camera.image_width)
     device = pc.get_xyz.device
     dtype = pc.get_xyz.dtype
+    render_mask = None
+    if not include_background and hasattr(pc, "get_foreground_mask"):
+        render_mask = pc.get_foreground_mask
+
+    means = pc.get_xyz
+    quats = pc.get_rotation
+    scales = pc.get_scaling
+    opacities = pc.get_opacity.squeeze(-1)
+    if render_mask is not None:
+        render_mask = render_mask.to(device=device, dtype=torch.bool)
+        means = means[render_mask]
+        quats = quats[render_mask]
+        scales = scales[render_mask]
+        opacities = opacities[render_mask]
+
+    if means.shape[0] == 0:
+        return {
+            "depth": torch.zeros((1, height, width), dtype=dtype, device=device),
+            "alpha": torch.zeros((1, height, width), dtype=dtype, device=device),
+            "meta": {},
+        }
 
     fx = width / (2.0 * math.tan(viewpoint_camera.FoVx * 0.5))
     fy = height / (2.0 * math.tan(viewpoint_camera.FoVy * 0.5))
@@ -137,10 +186,10 @@ def render_gsplat_depth(viewpoint_camera, pc: GaussianModel, render_mode="ED"):
     )[None].contiguous()
 
     renders, alphas, meta = rasterization(
-        means=pc.get_xyz,
-        quats=pc.get_rotation,
-        scales=pc.get_scaling,
-        opacities=pc.get_opacity.squeeze(-1),
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
         colors=None,
         viewmats=viewmat,
         Ks=K,

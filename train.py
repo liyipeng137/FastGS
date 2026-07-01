@@ -174,6 +174,66 @@ def save_rendered_depth_debug(model_path, iteration, cameras, gaussians, num_vie
     print(f"\n[ITER {iteration}] Saved rendered depth debug images to {out_dir}")
 
 
+def training_background_sphere(dataset, opt, pipe, scene, gaussians, background, tb_writer=None):
+    bg_iterations = int(getattr(opt, "bg_iterations", 0))
+    if bg_iterations <= 0 or not getattr(dataset, "add_background_sphere", False):
+        return
+
+    background_mask = gaussians._ensure_background_mask()
+    if not background_mask.any().item():
+        print("[BG] No background sphere points found. Skipping background pretrain.")
+        return
+    if getattr(opt, "optimizer_type", "default") != "default":
+        print("[BG] Background pretrain currently supports the default optimizer only. Skipping.")
+        return
+
+    bg_count = int(background_mask.sum().item())
+    print(f"[BG] Pretraining background sphere colors for {bg_iterations} iterations ({bg_count} points).")
+    progress_bar = tqdm(range(bg_iterations), desc="Background training")
+    viewpoint_stack = scene.getTrainCameras().copy()
+    ema_loss_for_log = 0.0
+
+    gaussians.optimizer.zero_grad(set_to_none=True)
+    if gaussians.shoptimizer is not None:
+        gaussians.shoptimizer.zero_grad(set_to_none=True)
+
+    for iteration in range(1, bg_iterations + 1):
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+
+        render_pkg = render_fastgs(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            opt.mult,
+            render_mask=background_mask,
+        )
+        image = render_pkg["render"]
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        rgb_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        rgb_loss.backward()
+
+        gaussians.apply_background_color_pretrain_constraints()
+        gaussians.optimizer.step()
+        gaussians.optimizer.zero_grad(set_to_none=True)
+        if gaussians.shoptimizer is not None:
+            gaussians.shoptimizer.zero_grad(set_to_none=True)
+
+        ema_loss_for_log = 0.4 * rgb_loss.item() + 0.6 * ema_loss_for_log
+        if iteration % 10 == 0:
+            progress_bar.set_postfix({"RGB": f"{ema_loss_for_log:.{7}f}"})
+            if tb_writer:
+                tb_writer.add_scalar("background_pretrain/rgb_loss", rgb_loss.item(), iteration)
+        progress_bar.update(1)
+
+    progress_bar.close()
+    print(f"[BG] Background color pretrain finished at iteration {bg_iterations}.")
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -199,6 +259,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     depth_debug_enabled = opt.lambda_depth > 0.0 and depth_prior_count > 0
     if depth_prior_count > 0:
         print(f"Loaded depth priors for {depth_prior_count}/{len(train_cameras)} training cameras")
+
+    if first_iter == 0:
+        training_background_sphere(dataset, opt, pipe, scene, gaussians, background, tb_writer)
+    elif int(getattr(opt, "bg_iterations", 0)) > 0 and getattr(dataset, "add_background_sphere", False):
+        print(f"[BG] Skipping background pretrain because training resumes from iteration {first_iter}.")
 
     # record time
     optim_start = torch.cuda.Event(enable_timing=True)
@@ -287,6 +352,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 loss = loss + depth_weight * depth_loss
         loss.backward()
+        gaussians.apply_background_constraints(
+            freeze_background_dc=getattr(dataset, "freeze_background_sphere_color", False),
+            freeze_background_xyz=getattr(dataset, "freeze_background_sphere_position", False),
+            freeze_background_scale=getattr(dataset, "freeze_background_sphere_scale", False),
+            freeze_background_rotation=getattr(dataset, "freeze_background_sphere_rotation", False),
+            freeze_background_opacity=getattr(dataset, "freeze_background_sphere_opacity", False),
+            freeze_background_sh_rest=getattr(dataset, "freeze_background_sphere_sh_rest", False),
+        )
 
         iter_end.record()
 
@@ -355,7 +428,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                                 importance_score = importance_score,
                                                 pruning_score = pruning_score,
                                                 scene_center = scene.scene_center,
-                                                scene_prune_dist_mult = scene.scene_prune_dist_mult)
+                                                scene_prune_dist_mult = scene.scene_prune_dist_mult,
+                                                prune_extent = scene.prune_extent)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
